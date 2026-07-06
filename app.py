@@ -86,41 +86,26 @@ def cached_detect_attacks(df_hash: str, _df: pd.DataFrame):
 
 st.sidebar.title("📊 Log Analyzer")
 
-mode = st.sidebar.radio(
-    "Режим работы",
-    ["Один лог", "Сравнение двух логов (до / после инцидента)"],
-    help="Сравнение полезно, если у вас есть срез лога до подозрительной активности и после",
-)
+df, report = None, None
+file_hash = None
 
-df, report, df_b, report_b = None, None, None, None
-file_hash, file_hash_b = None, None
+uploaded = st.sidebar.file_uploader("Загрузите access.log", type=["log", "txt"])
 
-if mode == "Один лог":
-    uploaded = st.sidebar.file_uploader("Загрузите access.log", type=["log", "txt"])
+if st.sidebar.button("🎬 Загрузить демо-лог", width="stretch",
+                      help="Тестовый лог с намеренно встроенными брутфорсом, "
+                           "сканированием уязвимостей и всплеском трафика — "
+                           "показывает все разделы дашборда сразу"):
+    st.session_state["use_demo"] = True
 
-    if st.sidebar.button("🎬 Загрузить демо-лог", width="stretch",
-                          help="Тестовый лог с намеренно встроенными брутфорсом, "
-                               "сканированием уязвимостей и всплеском трафика — "
-                               "показывает все разделы дашборда сразу"):
-        st.session_state["use_demo"] = True
-
-    if uploaded:
-        st.session_state["use_demo"] = False  # свой файл всегда важнее демо
-        df, report, file_hash = load_uploaded_file(uploaded)
-    elif st.session_state.get("use_demo"):
-        df, report, file_hash = load_demo_file()
-        if df is None:
-            st.sidebar.error("Демо-файл не найден на сервере (sample-data/sample_access.log).")
-        else:
-            st.sidebar.caption("📎 Показан демонстрационный лог")
-else:
-    col_a, col_b = st.sidebar.columns(2)
-    uploaded_a = st.sidebar.file_uploader("Лог «до» инцидента", type=["log", "txt"], key="log_a")
-    uploaded_b = st.sidebar.file_uploader("Лог «после» инцидента", type=["log", "txt"], key="log_b")
-    if uploaded_a:
-        df, report, file_hash = load_uploaded_file(uploaded_a)
-    if uploaded_b:
-        df_b, report_b, file_hash_b = load_uploaded_file(uploaded_b)
+if uploaded:
+    st.session_state["use_demo"] = False  # свой файл всегда важнее демо
+    df, report, file_hash = load_uploaded_file(uploaded)
+elif st.session_state.get("use_demo"):
+    df, report, file_hash = load_demo_file()
+    if df is None:
+        st.sidebar.error("Демо-файл не найден на сервере (sample-data/sample_access.log).")
+    else:
+        st.sidebar.caption("📎 Показан демонстрационный лог")
 
 
 if df is None or df.empty:
@@ -272,13 +257,9 @@ c6.metric("Трафик ботов", f"{filtered_df['is_bot'].mean() * 100:.1f}%
 # =========================================================================
 
 tab_names = ["📈 Дашборд", "🚨 Безопасность", "🥊 Брутфорс и аномалии", "📄 Данные и экспорт"]
-if df_b is not None:
-    tab_names.insert(3, "🔁 Сравнение")
 
 tabs = st.tabs(tab_names)
-tab_dashboard, tab_security, tab_incidents = tabs[0], tabs[1], tabs[2]
-tab_compare = tabs[3] if df_b is not None else None
-tab_export = tabs[-1]
+tab_dashboard, tab_security, tab_incidents, tab_export = tabs
 
 
 # --- Дашборд ---------------------------------------------------------
@@ -286,10 +267,27 @@ with tab_dashboard:
     if filtered_df.empty:
         st.info("Нет данных под текущие фильтры.")
     else:
-        st.subheader("Активность по часам")
-        hourly = filtered_df.groupby("hour").size().reset_index(name="Запросы")
-        fig = px.line(hourly, x="hour", y="Запросы", labels={"hour": "Час суток"}, template="plotly_dark")
+        st.subheader("Активность во времени")
+        # Группировка по реальной шкале времени, а не по абстрактному "часу суток" —
+        # видно, КОГДА именно был трафик и где реальные скачки, а не усреднённую
+        # картину по всем дням разом. Гранулярность подбирается по охваченному
+        # периоду: короткий лог — по часам, длинный — по дням/неделям, чтобы
+        # график не превращался в нечитаемую простыню точек.
+        time_span = filtered_df["datetime"].max() - filtered_df["datetime"].min()
+        if time_span <= pd.Timedelta(days=2):
+            freq, freq_label = "1h", "по часам"
+        elif time_span <= pd.Timedelta(days=14):
+            freq, freq_label = "1D", "по дням"
+        else:
+            freq, freq_label = "1W", "по неделям"
+
+        timeline = (
+            filtered_df.set_index("datetime").resample(freq).size().reset_index(name="Запросы")
+        )
+        timeline.columns = ["Время", "Запросы"]
+        fig = px.line(timeline, x="Время", y="Запросы", template="plotly_dark", markers=True)
         st.plotly_chart(fig, width="stretch")
+        st.caption(f"Группировка {freq_label} — подобрана автоматически по охваченному периоду лога.")
 
         col_l, col_r = st.columns(2)
         with col_l:
@@ -392,51 +390,6 @@ with tab_incidents:
             file_name="single_source_bursts.csv",
             mime="text/csv",
         )
-
-
-# --- Сравнение (если загружены два файла) -------------------------------
-if tab_compare is not None:
-    with tab_compare:
-        if df_b is None or df_b.empty:
-            st.info("Загрузите второй файл («после инцидента») в панели слева.")
-        else:
-            st.subheader("Сводное сравнение")
-
-            def summarize(d):
-                # Значения приводим к строке сразу — иначе колонка "До"/"После"
-                # получает смешанные типы (int + "12.3%") и Streamlit не может
-                # сериализовать DataFrame в Arrow для отображения.
-                return {
-                    "Запросов": str(len(d)),
-                    "Уникальных IP": str(d["ip"].nunique()),
-                    "Доля ошибок 4xx/5xx": f"{(d['status'] >= 400).mean() * 100:.1f}%",
-                    "502/504": str(int(d["status"].isin([502, 504]).sum())),
-                    "500": str(int((d["status"] == 500).sum())),
-                    "Доля ботов": f"{d['is_bot'].mean() * 100:.1f}%",
-                }
-
-            summary_a, summary_b = summarize(df), summarize(df_b)
-            compare_table = pd.DataFrame({"До": summary_a, "После": summary_b})
-            st.dataframe(compare_table, width="stretch")
-
-            st.divider()
-            st.subheader("Новые IP, которых не было в логе «до»")
-            new_ips = sorted(set(df_b["ip"]) - set(df["ip"]))
-            st.write(f"Найдено новых IP: {len(new_ips)}")
-            if new_ips:
-                new_ips_df = df_b[df_b["ip"].isin(new_ips)]["ip"].value_counts().reset_index()
-                new_ips_df.columns = ["ip", "запросов"]
-                st.dataframe(new_ips_df.head(50), width="stretch", hide_index=True)
-
-            st.divider()
-            st.subheader("Новые сигнатуры атак в логе «после»")
-            attacks_a = cached_detect_attacks(file_hash, df)
-            attacks_b = cached_detect_attacks(file_hash_b, df_b)
-            new_attack_ips = sorted(set(attacks_b["ip"]) - set(attacks_a["ip"])) if not attacks_b.empty else []
-            if new_attack_ips:
-                st.error(f"Новые IP со сканированием уязвимостей: {', '.join(new_attack_ips[:20])}")
-            else:
-                st.success("Новых источников сканирования в логе «после» не появилось.")
 
 
 # --- Данные и экспорт ----------------------------------------------------
